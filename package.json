@@ -1,0 +1,43 @@
+{
+  "name": "devrev-kg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.32.1",
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "bin": {
+    "kg": "dist/build.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/build.js dist/mcp/server.js",
+    "build:watch": "tsc -p tsconfig.json -w",
+    "kg:full": "node dist/build.js full",
+    "kg:affected": "node dist/build.js affected",
+    "kg:status": "node dist/build.js status",
+    "mcp:start": "node dist/mcp/server.js",
+    "mcp:inspect": "npx @modelcontextprotocol/inspector node dist/mcp/server.js",
+    "dev:full": "tsx src/build.ts full",
+    "dev:mcp": "tsx src/mcp/server.ts",
+    "wire": "node scripts/wire.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.5.0",
+    "commander": "^12.1.0",
+    "glob": "^11.0.0",
+    "typescript": "^5.6.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  }
+}
