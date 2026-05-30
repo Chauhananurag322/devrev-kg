@@ -6,9 +6,9 @@ Built originally for a private monorepo with **948 Nx projects, ~27k TS/TSX file
 
 ## Why
 
-Every fresh Claude Code session in a large monorepo starts from zero. To answer "where does `SprintSettingsWidget` live?" or "what apps exist here?", Claude burns tokens on `ls`, `Glob`, `Grep`, and reading multiple files. Across many sessions this is repeated waste.
+Every fresh agent session in a large monorepo starts from zero. To answer "where does `SprintSettingsWidget` live?" or "what apps exist here?", the agent burns tokens on `ls`, `Glob`, `Grep`, and reading multiple files. Across many sessions this is repeated waste.
 
-devrev-kg pre-indexes the repo into a small SQLite database with FTS5 and exposes 8 tools over an MCP stdio server, plus a session-start markdown overview. Net effect:
+devrev-kg pre-indexes the repo into a small SQLite database with FTS5 and exposes it over an MCP stdio server as **8 tools, 4 resources, and 2 prompts** — so any MCP client (Cursor, Cline, Zed, Claude Code) gets the context, not just Claude Code via a session-start hook. Net effect:
 
 | Question | Without KG | With KG |
 |---|---|---|
@@ -38,9 +38,11 @@ A full cold rebuild of the index runs in ~10 seconds on an M-series Mac.
         │ stdio JSON-RPC
         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Claude Code (running in your monorepo)                     │
-│  ─ SessionStart hook injects repo-map.md (~6k tokens)       │
-│  ─ MCP tools available as mcp__kg__*                        │
+│  Any MCP client (Cursor · Cline · Zed · Claude Code)        │
+│  ─ Resources (kg://repo-map, kg://package/{name}, …)        │
+│  ─ Prompts   (repo_overview, package_context)               │
+│  ─ Tools     (mcp__kg__find_symbol, who_imports, …)         │
+│  ─ Claude Code only: SessionStart hook auto-injects the map │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -66,6 +68,33 @@ The build pipeline:
 | `search_code({ query, package? })` | FTS5 search over symbol name + signature + jsdoc. |
 | `who_imports({ target, type_only? })` | Reverse lookup: which packages import a symbol or package, grouped. |
 | `get_dependency_path({ from, to, max_depth? })` | BFS over `package_deps`. Shortest import chain. |
+
+## Resources exposed by the MCP server
+
+Resources are the **standard, cross-client** way to surface read-only context. Any MCP client (Cursor, Cline, Zed, Claude Code) auto-discovers them on connect via `resources/list` — no client-specific hook required. They use a custom `kg://` URI scheme (these are not files on your disk; the index lives under `KG_DIR`).
+
+| Resource URI | Type | Contents |
+|---|---|---|
+| `kg://repo-map` | `text/markdown` | The repo overview map (apps, libs by domain, CLAUDE.md/skill paths, rules). **The primary context to load first.** |
+| `kg://index` | `application/json` | Flat array of every package: `{ name, kind, root, tags, group }`. |
+| `kg://last-build` | `application/json` | Build metadata (`builtAt`, `gitSha`, counts, phase) — for staleness checks. |
+| `kg://package/{name}` | `application/json` | Per-package manifest (template). The enumerated list is capped at 200, but **any** package name is readable; use `kg://index` or `list_packages` for the full set. |
+
+## Prompts exposed by the MCP server
+
+Prompts are the cross-client "slash command" primitive. They return user-role context messages.
+
+| Prompt | Args | Purpose |
+|---|---|---|
+| `repo_overview` | — | Loads the repo map as context. The portable, on-demand replacement for the SessionStart hook. |
+| `package_context` | `name` | Loads one package's manifest (deps, dependents, public exports) as context. |
+
+## Cross-client usage
+
+The resources and prompts above make the repo context available **without** the Claude-Code-specific SessionStart hook:
+
+- **Claude Code** — mention a resource in a message with `@devrev-kg:kg://repo-map`, or run a prompt as a slash command: `/mcp__devrev-kg__repo_overview`. (These complement the SessionStart hook from `pnpm wire`, which still auto-injects the map at session start.)
+- **Cursor / Cline / Zed** — once the server is registered, resources appear in the client's MCP resource picker and prompts appear as commands automatically. No SessionStart hook needed — that's the point of exposing these primitives.
 
 ## Requirements
 
@@ -179,6 +208,8 @@ devrev-kg/
 │   ├── mcp/
 │   │   ├── server.ts            stdio MCP entry
 │   │   ├── store.ts             read-only data store
+│   │   ├── resources.ts         kg:// resources (repo-map, index, package/{name})
+│   │   ├── prompts.ts           repo_overview / package_context prompts
 │   │   └── tools/               one file per tool
 │   └── util/
 │       ├── alias-map.ts         tsconfig.base.json paths parser
@@ -197,7 +228,7 @@ devrev-kg/
 
 - File-watcher to live-reload the MCP server's DB handle when kg.sqlite changes (eliminates the "restart Claude after rebuild" step)
 - True incremental `kg:affected` (currently triggers a full rebuild)
-- Optional Cursor / Cline / other-tool MCP integrations
+- Expose curated docs (CLAUDE.md / rules / skills) as `kg://` resources once the build writes their bodies into `KG_DIR` (currently only metadata is indexed)
 - Generalize beyond Nx: a pluggable workspace probe (Turbo, Bazel, npm workspaces)
 
 ## License

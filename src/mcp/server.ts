@@ -7,9 +7,9 @@
 // module will silently break the connection — Claude Code drops servers that
 // emit non-protocol stdout with no useful error.
 //
-// Configuration: KG_DIR env var. Set by scripts/wire-devrev-web.mjs to
-// "/Users/admin/.claude/projects/-Users-admin-Office-devrev-web/graph". If
-// unset, falls back to the default outputDir from config.json.
+// Configuration: KG_DIR env var. Set by scripts/wire.mjs to the build's
+// outputDir (e.g. <devrev-kg>/.kg-output/graph). If unset, falls back to the
+// default outputDir from config.json.
 //
 // Tools registered:
 //   Phase 2:
@@ -23,6 +23,16 @@
 //   Phase 3b:
 //     - who_imports         reverse import lookup grouped by importing package
 //     - get_dependency_path BFS over package_deps for shortest dep chain
+//
+// Resources registered (resources.ts) — standard, cross-client context:
+//     - kg://repo-map        the repo overview (markdown)
+//     - kg://index           the flat package index (json)
+//     - kg://last-build      build metadata (json)
+//     - kg://package/{name}  per-package manifest (json template)
+//
+// Prompts registered (prompts.ts) — cross-client slash commands:
+//     - repo_overview        load the repo map as context
+//     - package_context      load one package's manifest as context
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -36,6 +46,8 @@ import { registerFindSymbol } from "./tools/find_symbol.js";
 import { registerSearchCode } from "./tools/search_code.js";
 import { registerWhoImports } from "./tools/who_imports.js";
 import { registerGetDependencyPath } from "./tools/get_dependency_path.js";
+import { registerResources } from "./resources.js";
+import { registerPrompts } from "./prompts.js";
 import { log } from "../log.js";
 
 async function main(): Promise<void> {
@@ -49,20 +61,23 @@ async function main(): Promise<void> {
   const server = new McpServer(
     { name: "devrev-kg", version: "0.1.0" },
     {
-      // Capabilities are auto-derived from registered tools/resources.
-      // Explicit instructions help Claude know when to reach for these tools.
+      // Capabilities are auto-derived from registered tools/resources/prompts.
+      // Instructions are kept generic (no hardcoded repo path) so the server
+      // is portable across any target monorepo. We use store.index.length —
+      // the live count of indexed packages — never the build's packageCount.
       instructions:
-        "devrev-kg is a knowledge-graph MCP server for /Users/admin/Office/devrev-web. " +
-        "Use these tools instead of grepping the repo: " +
+        `devrev-kg is a knowledge-graph MCP server for a large Nx monorepo (${store.index.length} packages indexed). ` +
+        "For repo context, read the kg://repo-map resource or run the repo_overview prompt — " +
+        "that map lists apps, libs grouped by domain, CLAUDE.md paths, skills, and rules. " +
+        "Then use these tools instead of grepping the repo: " +
         "list_packages to enumerate or filter projects, " +
         "get_package to retrieve a manifest with dependsOn/dependents/publicExports, " +
         "find_symbol for symbol lookup by name (exact + FTS fallback), " +
         "search_code for FTS5 over name/signature/jsdoc, " +
         "who_imports to find files importing a package or symbol, " +
         "get_dependency_path for the shortest import chain between two packages, " +
-        "find_skill to discover relevant SKILL.md files, " +
-        "get_repo_overview as a fallback for the always-injected map. " +
-        `Loaded ${store.index.length} packages from ${kgDir}.`,
+        "find_skill to discover relevant SKILL.md files. " +
+        "Per-package manifests are also available as kg://package/{name} resources.",
     },
   );
 
@@ -74,6 +89,11 @@ async function main(): Promise<void> {
   registerSearchCode(server, store);
   registerWhoImports(server, store);
   registerGetDependencyPath(server, store);
+
+  // Standard MCP primitives — resources + prompts — so the repo context is
+  // discoverable by ANY client, not just Claude Code's SessionStart hook.
+  registerResources(server, store);
+  registerPrompts(server, store);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
