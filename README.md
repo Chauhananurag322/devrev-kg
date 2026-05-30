@@ -93,7 +93,9 @@ Prompts are the cross-client "slash command" primitive. They return user-role co
 
 The resources and prompts above make the repo context available **without** the Claude-Code-specific SessionStart hook:
 
-- **Claude Code** — mention a resource in a message with `@devrev-kg:kg://repo-map`, or run a prompt as a slash command: `/mcp__devrev-kg__repo_overview`. (These complement the SessionStart hook from `pnpm wire`, which still auto-injects the map at session start.)
+> The prefix matches the **server name you register** (`claude mcp add <name> …`). The examples below use `kg`; if you register it under a different name, substitute accordingly.
+
+- **Claude Code** — mention a resource in a message with `@kg:kg://repo-map`, or run a prompt as a slash command: `/mcp__kg__repo_overview`. (These complement the optional SessionStart hook from `pnpm wire`, which auto-injects the map at session start.)
 - **Cursor / Cline / Zed** — once the server is registered, resources appear in the client's MCP resource picker and prompts appear as commands automatically. No SessionStart hook needed — that's the point of exposing these primitives.
 
 ## Requirements
@@ -127,20 +129,31 @@ pnpm build
 pnpm kg:full
 ```
 
-After the first build:
+`pnpm kg:full` writes the index to `devrev-kg/.kg-output/graph` (the default `KG_DIR`).
+
+Then register the MCP server with Claude Code. Run this **from inside your monorepo** so the server binds to that project's scope:
 
 ```bash
-# Wire up Claude Code (registers SessionStart hooks in your target repo)
-pnpm wire
-
-# Register the MCP server. Run from inside your target repo:
 cd ../my-monorepo
 claude mcp add kg --scope local \
-  --env KG_DIR=$(pwd)/../devrev-kg/.kg-output/graph \
-  -- node $(pwd)/../devrev-kg/dist/mcp/server.js
+  --env KG_DIR="$(pwd)/../devrev-kg/.kg-output/graph" \
+  -- node "$(pwd)/../devrev-kg/dist/mcp/server.js"
 
 # Restart Claude Code
 ```
+
+After restart, `/mcp` lists the `kg` server with its **8 tools, 4 resources, and 2 prompts**. This is all any MCP client needs — the same `node …/server.js` + `KG_DIR` works in Cursor, Cline, and Zed.
+
+### Optional: auto-inject the map (Claude Code only)
+
+To also have the repo-map injected at every session start (and a background rebuild trigger on session start):
+
+```bash
+cd ../devrev-kg
+pnpm wire    # adds a SessionStart hook to your monorepo's .claude/settings.local.json
+```
+
+This is a Claude-Code convenience layered on top — the resources/prompts above already make the context available everywhere without it.
 
 ## Configuration
 
