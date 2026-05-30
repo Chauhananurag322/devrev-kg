@@ -8,15 +8,23 @@ Built originally for a private monorepo with **948 Nx projects, ~27k TS/TSX file
 
 Every fresh agent session in a large monorepo starts from zero. To answer "where does `SprintSettingsWidget` live?" or "what apps exist here?", the agent burns tokens on `ls`, `Glob`, `Grep`, and reading multiple files. Across many sessions this is repeated waste.
 
-devrev-kg pre-indexes the repo into a small SQLite database with FTS5 and exposes it over an MCP stdio server as **8 tools, 4 resources, and 2 prompts** — so any MCP client (Cursor, Cline, Zed, Claude Code) gets the context, not just Claude Code via a session-start hook. Net effect:
+devrev-kg pre-indexes the repo into a small SQLite database with FTS5 and exposes it over an MCP stdio server as **8 tools, 4 resources, and 2 prompts** — so any MCP client (Cursor, Cline, Zed, Claude Code) gets the context, not just Claude Code via a session-start hook.
 
-| Question | Without KG | With KG |
-|---|---|---|
-| "What apps are in this repo?" | 3-5 tool calls + reading | 0 tool calls (in injected context) |
-| "Where is `SprintSettingsWidget` defined?" | 5-10 `Glob` + `Grep` + `Read` | 1 `mcp__kg__find_symbol` call |
-| "Who imports `data-layer-dl-utils`?" | repo-wide grep, 10s+ | 1 `mcp__kg__who_imports` call, <100ms |
+### Token savings (measured)
+
+Measured against the real target monorepo (953 Nx projects, ~27k files), comparing the tokens an agent consumes to answer a question by exploring the filesystem vs. one KG call. Token counts use the standard `chars / 4` heuristic.
+
+| Question | Without KG | With KG | Saved |
+|---|---:|---:|---:|
+| Locate a symbol's definition (`Grep` matches + `Read` the file) | ~1,300–2,300 tok | ~115 tok (`find_symbol`) | **~91–95%** |
+| "Who imports this package?" (repo-wide grep + manual dedup) | ~22,700 tok | ~30 tok (`who_imports`) | **~99.9%** |
+| "What apps exist here?" (`ls` + read several `project.json`) | ~970 tok (still partial) | ~420 tok (`list_packages`) — or **0** if the repo-map is already injected | **~57–100%** |
+
+The repo-map injected once per session is ~8.7k tokens, but it **replaces the recurring `ls`/`Glob`/`Grep`/`Read` discovery loop** that otherwise repeats throughout a session — so it usually pays for itself within the first few lookups, and every lookup after that is near-free.
 
 A full cold rebuild of the index runs in ~10 seconds on an M-series Mac.
+
+> Numbers above are from this repo's measurement harness on devrev-web; exact values depend on the symbol/package and your monorepo. The pattern — one bounded KG response vs. an unbounded grep-and-read sweep — holds for any large repo.
 
 ## How it works
 
