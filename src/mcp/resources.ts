@@ -105,6 +105,48 @@ export function registerResources(server: McpServer, store: Store): void {
     }),
   );
 
+  // kg://memory — a compact index of saved cross-session memory: name,
+  // description, type and origin, but NOT bodies. That is the whole point.
+  // Claude Code's own MEMORY.md loads every body every session, so memory
+  // becomes a context tax that grows with each fact saved. This lists what is
+  // known so bodies can be fetched via recall_memory only when relevant —
+  // the same index-then-fetch shape as kg://index + get_package.
+  server.registerResource(
+    "memory",
+    "kg://memory",
+    {
+      title: "Memory index",
+      description:
+        "Index of saved cross-session memory (name, description, type, origin) — no bodies. Fetch bodies on demand with the recall_memory tool.",
+      mimeType: "application/json",
+    },
+    async (uri: URL) => {
+      const docs = await store.readMemories();
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(
+              {
+                dirs: store.memoryDirs,
+                total: docs.length,
+                memories: docs.map((d) => ({
+                  name: d.name,
+                  description: d.description,
+                  type: d.type,
+                  origin: d.origin,
+                })),
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
   // kg://package/{name} — per-package manifest, one resource per package.
   // The `list` callback enumerates names (capped); the read callback resolves
   // any name on demand, mirroring get_package.ts including its "did you mean"

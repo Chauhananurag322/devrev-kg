@@ -16,9 +16,11 @@
 
 import { readFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import type { CuratedDoc, IndexEntry, LastBuild, Manifest } from "../types.js";
+import { memoryDirForPath, readMemories, type MemoryDoc } from "./memory.js";
 
 type Db = Database.Database;
 
@@ -31,12 +33,67 @@ export interface Store {
   // SQLite handle. Null when Phase 3 hasn't run yet (no DB on disk).
   // Opened read-only so concurrent rebuilds don't conflict.
   db: Db | null;
+  // Claude Code memory dirs we surface, in priority order. Resolved once at
+  // startup (the paths are static); the FILES inside are re-read per call.
+  memoryDirs: string[];
   // File ops scoped to this store.
   readManifest(name: string): Promise<Manifest | null>;
   readRepoMap(): Promise<string | null>;
+  // Deliberately NOT cached — see the note in memory.ts. Memory mutates
+  // mid-session, so a startup snapshot would miss the facts saved during the
+  // very session that needs them.
+  readMemories(): Promise<MemoryDoc[]>;
 }
 
-export async function openStore(kgDir: string): Promise<Store> {
+export interface OpenStoreOptions {
+  // Absolute path of the indexed monorepo. Used only to locate ITS memory dir,
+  // so facts saved while working in the target repo are recallable from here.
+  targetRepo?: string;
+  // Absolute path of the devrev-kg checkout, so ITS memory dir is included too.
+  // Memory is keyed by CWD slug, and work on the indexer happens in a different
+  // CWD than work in the monorepo — without this, the two never see each other,
+  // which is the whole problem this feature exists to fix.
+  kgRepo?: string;
+  // Explicit dirs from $KG_MEMORY_DIRS. When set, these are added ahead of the
+  // derived ones — an escape hatch for layouts we can't infer.
+  memoryDirs?: string[];
+}
+
+// Work out which memory dirs to read.
+//
+// Native memory is keyed by CWD slug, so the facts relevant to a monorepo are
+// split across at least two stores: the target repo's, and this tool's own.
+// We collect every plausible dir and let readMemories() skip the ones that
+// don't exist (an empty project has no memory dir at all — Claude Code prunes
+// them, so "missing" is the common case, not an error).
+function deriveMemoryDirs(
+  kgDir: string,
+  opts: OpenStoreOptions,
+  home: string,
+): string[] {
+  const candidates: string[] = [...(opts.memoryDirs ?? [])];
+
+  // The common deployment has KG_DIR at ~/.claude/projects/<slug>/graph, which
+  // puts the matching memory store right next door.
+  candidates.push(resolve(kgDir, "..", "memory"));
+
+  if (opts.targetRepo) {
+    candidates.push(memoryDirForPath(opts.targetRepo, home));
+  }
+  if (opts.kgRepo) {
+    candidates.push(memoryDirForPath(opts.kgRepo, home));
+  }
+
+  // Dedupe, preserving priority order. Overlap is expected, not exceptional:
+  // in the documented layout KG_DIR lives under the target repo's project dir,
+  // so the first two candidates resolve to the same path.
+  return [...new Set(candidates)];
+}
+
+export async function openStore(
+  kgDir: string,
+  opts: OpenStoreOptions = {},
+): Promise<Store> {
   const indexPath = join(kgDir, "packages", "_index.json");
   const curatedPath = join(kgDir, "curated.json");
   const lastBuildPath = join(kgDir, "last-build.json");
@@ -71,6 +128,8 @@ export async function openStore(kgDir: string): Promise<Store> {
     db.pragma("query_only = true");
   }
 
+  const memoryDirs = deriveMemoryDirs(kgDir, opts, homedir());
+
   return {
     kgDir,
     index,
@@ -78,6 +137,10 @@ export async function openStore(kgDir: string): Promise<Store> {
     curated,
     lastBuild,
     db,
+    memoryDirs,
+    async readMemories(): Promise<MemoryDoc[]> {
+      return readMemories(memoryDirs);
+    },
     async readManifest(name: string): Promise<Manifest | null> {
       // Defensive: reject path-traversal attempts via sneaky names.
       if (name.includes("/") || name.includes("..")) return null;

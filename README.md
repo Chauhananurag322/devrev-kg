@@ -8,7 +8,7 @@ Built originally for a private monorepo with **948 Nx projects, ~27k TS/TSX file
 
 Every fresh agent session in a large monorepo starts from zero. To answer "where does `SprintSettingsWidget` live?" or "what apps exist here?", the agent burns tokens on `ls`, `Glob`, `Grep`, and reading multiple files. Across many sessions this is repeated waste.
 
-devrev-kg pre-indexes the repo into a small SQLite database with FTS5 and exposes it over an MCP stdio server as **8 tools, 4 resources, and 2 prompts** — so any MCP client (Cursor, Cline, Zed, Claude Code) gets the context, not just Claude Code via a session-start hook.
+devrev-kg pre-indexes the repo into a small SQLite database with FTS5 and exposes it over an MCP stdio server as **9 tools, 5 resources, and 2 prompts** — so any MCP client (Cursor, Cline, Zed, Claude Code) gets the context, not just Claude Code via a session-start hook.
 
 ### Token savings (measured)
 
@@ -76,6 +76,7 @@ The build pipeline:
 | `search_code({ query, package? })` | FTS5 search over symbol name + signature + jsdoc. |
 | `who_imports({ target, type_only? })` | Reverse lookup: which packages import a symbol or package, grouped. |
 | `get_dependency_path({ from, to, max_depth? })` | BFS over `package_deps`. Shortest import chain. |
+| `recall_memory({ topic, type?, limit? })` | Search saved cross-session memory (decisions, preferences, rationale). |
 
 ## Resources exposed by the MCP server
 
@@ -86,6 +87,7 @@ Resources are the **standard, cross-client** way to surface read-only context. A
 | `kg://repo-map` | `text/markdown` | The repo overview map (apps, libs by domain, CLAUDE.md/skill paths, rules). **The primary context to load first.** |
 | `kg://index` | `application/json` | Flat array of every package: `{ name, kind, root, tags, group }`. |
 | `kg://last-build` | `application/json` | Build metadata (`builtAt`, `gitSha`, counts, phase) — for staleness checks. |
+| `kg://memory` | `application/json` | Index of saved cross-session memory: `name`, `description`, `type`, `origin`. **No bodies** — fetch those with `recall_memory`. |
 | `kg://package/{name}` | `application/json` | Per-package manifest (template). The enumerated list is capped at 200, but **any** package name is readable; use `kg://index` or `list_packages` for the full set. |
 
 ## Prompts exposed by the MCP server
@@ -105,6 +107,45 @@ The resources and prompts above make the repo context available **without** the 
 
 - **Claude Code** — mention a resource in a message with `@kg:kg://repo-map`, or run a prompt as a slash command: `/mcp__kg__repo_overview`. (These complement the optional SessionStart hook from `pnpm wire`, which auto-injects the map at session start.)
 - **Cursor / Cline / Zed** — once the server is registered, resources appear in the client's MCP resource picker and prompts appear as commands automatically. No SessionStart hook needed — that's the point of exposing these primitives.
+
+## Memory integration
+
+`recall_memory` + `kg://memory` read the **same files Claude Code's own memory tool
+writes** (`~/.claude/projects/<slug>/memory/*.md`). This is a second lens on one store,
+not a parallel copy — anything saved natively is immediately queryable, with no sync step
+to drift out of date.
+
+**What it adds over native recall:**
+
+1. **Cross-project.** Native memory is keyed by CWD slug, so `-Users-admin-Office-devrev-kg`
+   and `-Users-admin-Office-devrev-web` are sealed off from each other — a fact learned while
+   working on the indexer is invisible while working in the monorepo it indexes. The server
+   reads both stores and tags every hit with its `origin`.
+2. **Index-then-fetch.** `MEMORY.md` is loaded in full every session, so native memory is a
+   fixed context tax that grows with every fact saved. `kg://memory` lists descriptions only
+   (~260 tokens for 4 memories); bodies arrive via `recall_memory` when relevant. The
+   always-on cost stays flat as the corpus grows.
+
+**What it deliberately does not read:** session transcripts (`<slug>/*.jsonl`). One measured
+session was ~693 KB ≈ 173k tokens of verbatim tool output and dead ends — including claims
+later proven wrong in that same session. Recalling those would resurrect corrected errors.
+Memory files are curated claims, which is the right input for recall.
+
+**The division of labour** — the index answers what the code *is*; memory answers *why*:
+
+| | Index (symbols, packages, imports) | Memory |
+|---|---|---|
+| Answers | where / what / who imports | why we did it this way, what you prefer |
+| Source | derived from the repo, stamped with `gitSha` | written deliberately, one fact per file |
+| Staleness | impossible — rebuilt in ~12s on sha drift | silent; must be corrected or deleted by hand |
+
+That asymmetry is the rule: **if a query can derive it, index it — never memorize it.** A
+memorized file path survives the file being moved and then actively misleads. Rationale has
+the opposite property: expensive to reconstruct, and unaffected when files move.
+
+Memory dirs are auto-derived from `KG_DIR` and `config.json`'s `targetRepo`. Override with
+`KG_MEMORY_DIRS` (colon-separated, like `PATH`) for layouts that can't be inferred. Missing
+dirs are skipped silently — Claude Code prunes empty ones, so absence is normal.
 
 ## Requirements
 
@@ -150,7 +191,7 @@ claude mcp add kg --scope local \
 # Restart Claude Code
 ```
 
-After restart, `/mcp` lists the `kg` server with its **8 tools, 4 resources, and 2 prompts**. This is all any MCP client needs — the same `node …/server.js` + `KG_DIR` works in Cursor, Cline, and Zed.
+After restart, `/mcp` lists the `kg` server with its **9 tools, 5 resources, and 2 prompts**. This is all any MCP client needs — the same `node …/server.js` + `KG_DIR` works in Cursor, Cline, and Zed.
 
 ### Optional: auto-inject the map + keep the tools in view (Claude Code only)
 
@@ -250,7 +291,8 @@ devrev-kg/
 │   ├── mcp/
 │   │   ├── server.ts            stdio MCP entry
 │   │   ├── store.ts             read-only data store
-│   │   ├── resources.ts         kg:// resources (repo-map, index, package/{name})
+│   │   ├── memory.ts            Claude Code memory reader (cross-project recall)
+│   │   ├── resources.ts         kg:// resources (repo-map, index, memory, package/{name})
 │   │   ├── prompts.ts           repo_overview / package_context prompts
 │   │   └── tools/               one file per tool
 │   └── util/

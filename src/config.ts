@@ -19,7 +19,9 @@ import { gitSha } from "./util/git.js";
 //   - node (running from dist/config.js)
 // because in both cases `..` from this file's directory lands at REPO_ROOT.
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(__dirname, "..");
+// Exported: the MCP server needs it to locate this repo's own Claude Code
+// memory dir, which is keyed by the kg checkout path (not the target repo's).
+export const REPO_ROOT = resolve(__dirname, "..");
 
 // Defaults applied when the config file omits the field. Only `targetRepo`
 // has no default — every other field can be inferred so a fresh clone with

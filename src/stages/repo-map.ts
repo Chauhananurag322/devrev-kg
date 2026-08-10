@@ -97,9 +97,13 @@ function renderRouting(phase: 1 | 2 | 3 | 4, pkgCount: number): string {
 
   lines.push(
     `| Find a relevant skill | \`mcp__kg__find_skill({ topic })\` | globbing \`.claude/skills\` |`,
+    `| Recall a past decision / preference | \`mcp__kg__recall_memory({ topic })\` | re-deriving it |`,
     ``,
     `Then \`Read\` the specific files the KG points at. \`Grep\`/\`Glob\` stay useful for` +
       ` non-code files, string literals, and config — things the symbol index does not cover.`,
+    ``,
+    `The split: the index answers what the code **is** (derivable — never guess at it),` +
+      ` \`recall_memory\` answers **why** it is that way (not derivable from source).`,
     ``,
   );
 

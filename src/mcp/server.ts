@@ -23,11 +23,14 @@
 //   Phase 3b:
 //     - who_imports         reverse import lookup grouped by importing package
 //     - get_dependency_path BFS over package_deps for shortest dep chain
+//   Memory:
+//     - recall_memory       cross-session memory lookup (see mcp/memory.ts)
 //
 // Resources registered (resources.ts) — standard, cross-client context:
 //     - kg://repo-map        the repo overview (markdown)
 //     - kg://index           the flat package index (json)
 //     - kg://last-build      build metadata (json)
+//     - kg://memory          memory index, descriptions only (json)
 //     - kg://package/{name}  per-package manifest (json template)
 //
 // Prompts registered (prompts.ts) — cross-client slash commands:
@@ -36,7 +39,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, REPO_ROOT } from "../config.js";
 import { openStore } from "./store.js";
 import { registerGetRepoOverview } from "./tools/get_repo_overview.js";
 import { registerListPackages } from "./tools/list_packages.js";
@@ -46,6 +49,7 @@ import { registerFindSymbol } from "./tools/find_symbol.js";
 import { registerSearchCode } from "./tools/search_code.js";
 import { registerWhoImports } from "./tools/who_imports.js";
 import { registerGetDependencyPath } from "./tools/get_dependency_path.js";
+import { registerRecallMemory } from "./tools/recall_memory.js";
 import { registerResources } from "./resources.js";
 import { registerPrompts } from "./prompts.js";
 import { log } from "../log.js";
@@ -54,9 +58,25 @@ async function main(): Promise<void> {
   // Resolve KG_DIR. The env var wins — the wiring script sets it, and we want
   // multiple targetRepo configurations to be possible eventually. Falling back
   // to the config.json default keeps `pnpm mcp:start` workable without env vars.
-  const kgDir = process.env.KG_DIR ?? (await loadConfig()).outputDir;
+  // config.json is optional at runtime (KG_DIR alone is enough to serve the
+  // index), so tolerate its absence. We want it when present purely to locate
+  // the target repo's memory dir — see deriveMemoryDirs in store.ts.
+  const config = await loadConfig().catch(() => null);
+  const kgDir = process.env.KG_DIR ?? config?.outputDir;
+  if (!kgDir) {
+    throw new Error(
+      "KG_DIR is unset and config.json could not be read — cannot locate the index.",
+    );
+  }
 
-  const store = await openStore(kgDir);
+  // Explicit override wins, for layouts we can't infer. Colon-separated, like PATH.
+  const envMemoryDirs = process.env.KG_MEMORY_DIRS?.split(":").filter(Boolean);
+
+  const store = await openStore(kgDir, {
+    targetRepo: config?.targetRepo,
+    kgRepo: REPO_ROOT,
+    memoryDirs: envMemoryDirs,
+  });
 
   const server = new McpServer(
     { name: "devrev-kg", version: "0.1.0" },
@@ -77,7 +97,11 @@ async function main(): Promise<void> {
         "who_imports to find files importing a package or symbol, " +
         "get_dependency_path for the shortest import chain between two packages, " +
         "find_skill to discover relevant SKILL.md files. " +
-        "Per-package manifests are also available as kg://package/{name} resources.",
+        "Per-package manifests are also available as kg://package/{name} resources. " +
+        "Separately, recall_memory retrieves saved cross-session context — decisions, " +
+        "preferences, and rationale that are NOT derivable from the source. Rule of thumb: " +
+        "if the answer is in the code, query the index; if it is why the code is that way, " +
+        "recall memory. The kg://memory resource lists what is remembered without loading bodies.",
     },
   );
 
@@ -89,6 +113,7 @@ async function main(): Promise<void> {
   registerSearchCode(server, store);
   registerWhoImports(server, store);
   registerGetDependencyPath(server, store);
+  registerRecallMemory(server, store);
 
   // Standard MCP primitives — resources + prompts — so the repo context is
   // discoverable by ANY client, not just Claude Code's SessionStart hook.
