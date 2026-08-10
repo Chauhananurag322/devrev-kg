@@ -13,13 +13,19 @@
 //
 // Sections (in order):
 //   1. Header (built timestamp + short git sha)
-//   2. Stack one-liner with counts
-//   3. Apps table (all 11)
-//   4. Libs by domain (grouped, capped at 8 per group)
-//   5. CLAUDE.md files (all 12)
-//   6. Skills (all 12, descriptions truncated)
-//   7. Rules (all 19)
-//   8. Querying further (MCP tools available in current phase)
+//   2. Routing table — when to use which MCP tool instead of Grep/Glob/Read
+//   3. Stack one-liner with counts
+//   4. Apps table (all 11)
+//   5. Libs by domain (grouped, capped at 8 per group)
+//   6. CLAUDE.md files (all 12)
+//   7. Skills (all 12, descriptions truncated)
+//   8. Rules (all 19)
+//   9. Querying further (MCP tools available in current phase)
+//
+// Section 2 is deliberately FIRST (right after the header) and imperative.
+// Earlier revisions listed only bare tool names in the footer — ~10k tokens
+// below the top of the file — and agents reliably ignored them, reaching for
+// Grep/Glob out of habit. Routing guidance has to lead, not trail.
 
 import type { BuildContext, CuratedDoc, Pkg } from "../types.js";
 import { writeFileAtomic } from "../util/fs-atomic.js";
@@ -50,6 +56,54 @@ function truncate(s: string, max: number): string {
 
 function renderHeader(builtAt: string, gitShaShort: string): string {
   return `# devrev-web — repo map\n\n_Built ${builtAt} · sha ${gitShaShort}_\n`;
+}
+
+// Imperative tool-routing table. Rendered directly under the header so it is
+// the first thing read, and phrased as instructions ("use X, not Y") rather
+// than a capability list — a bare list of tool names does not change behaviour.
+//
+// Only advertises tools that exist at this build's phase, matching renderFooter.
+function renderRouting(phase: 1 | 2 | 3 | 4, pkgCount: number): string {
+  if (phase < 2) {
+    return [
+      `## How to explore this repo`,
+      ``,
+      `_The KG MCP server is not wired up yet (Phase 1 build). Use the map below plus the standard tools (Read/Grep/Glob)._`,
+      ``,
+    ].join("\n");
+  }
+
+  const lines = [
+    `## ⚡ Read this first — use the KG, not filesystem search`,
+    ``,
+    `This repo has ${pkgCount} packages. A repo-wide \`Grep\`/\`Glob\` here costs thousands of` +
+      ` tokens and often misses results. The \`kg\` MCP server has the whole repo pre-indexed.` +
+      ` **Default to it for any "where / what / who" question about code you have not already read.**`,
+    ``,
+    `| If you need to… | Use this | Not this |`,
+    `|---|---|---|`,
+    `| Find where a symbol is defined | \`mcp__kg__find_symbol({ name })\` | \`Grep\` for the name |`,
+    `| Search by concept / partial name | \`mcp__kg__search_code({ query })\` | \`Grep -r\` |`,
+    `| List / filter projects | \`mcp__kg__list_packages({ glob, kind, tag })\` | \`ls\`, \`Glob\` |`,
+    `| A package's deps, dependents, exports | \`mcp__kg__get_package({ name })\` | reading \`project.json\` + \`index.ts\` |`,
+  ];
+
+  if (phase >= 3) {
+    lines.push(
+      `| Who imports a package or symbol | \`mcp__kg__who_imports({ target })\` | repo-wide \`Grep\` |`,
+      `| How package A reaches package B | \`mcp__kg__get_dependency_path({ from, to })\` | tracing imports by hand |`,
+    );
+  }
+
+  lines.push(
+    `| Find a relevant skill | \`mcp__kg__find_skill({ topic })\` | globbing \`.claude/skills\` |`,
+    ``,
+    `Then \`Read\` the specific files the KG points at. \`Grep\`/\`Glob\` stay useful for` +
+      ` non-code files, string literals, and config — things the symbol index does not cover.`,
+    ``,
+  );
+
+  return lines.join("\n");
 }
 
 function renderStack(pkgs: Pkg[]): string {
@@ -235,6 +289,7 @@ export async function writeRepoMap(
 
   const sections = [
     renderHeader(builtAt, sha),
+    renderRouting(phase, pkgs.length),
     renderStack(pkgs),
     renderApps(pkgs),
     renderLibs(pkgs),

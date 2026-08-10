@@ -7,6 +7,14 @@
 //   - hooks.SessionStart with two entries:
 //       1. cat repo-map.md into every session's context
 //       2. invoke maybe-rebuild.sh to refresh the index in the background
+//   - hooks.UserPromptSubmit with one entry:
+//       3. invoke kg-hint.sh to re-state the KG routing rule on every prompt
+//
+// Why both: SessionStart fires ONCE per session, so its guidance drifts far
+// up-context and agents fall back to habitual Grep/Glob after a few turns.
+// UserPromptSubmit fires on every prompt, keeping the routing rule in view.
+// SessionStart carries the bulk payload (the map); UserPromptSubmit carries a
+// ~50-token pointer, since its cost is paid on every single turn.
 //
 // MCP server registration is NOT done here — Claude Code's `claude mcp add`
 // CLI is the supported path for that. See README.
@@ -38,6 +46,9 @@ const TARGET_REPO = config.targetRepo;
 const KG_DIR = config.outputDir;
 const TARGET = join(TARGET_REPO, ".claude", "settings.local.json");
 const REBUILD_HOOK = join(REPO_ROOT, "scripts", "maybe-rebuild.sh");
+// KG_DIR is baked in as an argument so the hint script stays dependency-free
+// (no config parsing) — it runs on every prompt, so startup cost matters.
+const HINT_HOOK = `${join(REPO_ROOT, "scripts", "kg-hint.sh")} ${KG_DIR}`;
 
 if (!TARGET_REPO || !KG_DIR) {
   console.error("wire: config.json is missing targetRepo or outputDir");
@@ -57,6 +68,10 @@ const desiredHookGroup = {
   ],
 };
 
+const desiredPromptHookGroup = {
+  hooks: [{ type: "command", command: HINT_HOOK }],
+};
+
 // ---- Main --------------------------------------------------------------
 
 function readCurrent() {
@@ -71,51 +86,71 @@ function readCurrent() {
   }
 }
 
-function findExistingGroup(sessionStart) {
-  if (!Array.isArray(sessionStart)) return null;
+// Does this group own any command matching `match`?
+function groupMatches(group, match) {
   return (
-    sessionStart.find(
-      (group) =>
-        Array.isArray(group?.hooks) &&
-        group.hooks.some((h) => h?.command === HOOK_COMMAND),
-    ) ?? null
+    Array.isArray(group?.hooks) &&
+    group.hooks.some((h) => typeof h?.command === "string" && match(h.command))
   );
 }
+
+// Install exactly one canonical group of ours into `groups`, keyed by `match`.
+//
+// Matching is by PREDICATE, never string equality: our command strings embed
+// absolute paths (KG_DIR, REPO_ROOT), and those legitimately change — an
+// earlier install wrote `cd ~/Office/devrev-kg` where we now emit the resolved
+// absolute path. Exact-match treated that as "not installed" and appended a
+// second group, which silently injected the 40KB repo-map TWICE per session.
+//
+// So: drop every group of ours, then append one freshly-built group. That
+// refreshes stale paths and self-heals any duplicates a previous run left
+// behind. Groups we don't recognise are preserved untouched and in order.
+function replaceGroup(groups, match, desired) {
+  const existing = Array.isArray(groups) ? groups : [];
+  const foreign = existing.filter((g) => !groupMatches(g, match));
+  return {
+    groups: [...foreign, desired],
+    removed: existing.length - foreign.length,
+  };
+}
+
+// Stable identities — the part of each command that does NOT vary with
+// configured paths.
+const isRepoMapHook = (c) => c.includes("always/repo-map.md");
+const isHintHook = (c) => c.includes("kg-hint.sh");
 
 function merge(current) {
   const next = { ...current };
 
-  // hooks.SessionStart: ensure our group exists with both repo-map cat AND
-  // the rebuild trigger. Idempotent against partial installs.
-  const existing = current.hooks?.SessionStart ?? [];
-  const group = findExistingGroup(existing);
+  // SessionStart: cat the map + trigger a background rebuild. Rebuilt from
+  // scratch so a re-wire after moving outputDir refreshes both commands.
+  const session = replaceGroup(
+    current.hooks?.SessionStart,
+    isRepoMapHook,
+    desiredHookGroup,
+  );
 
-  let sessionStart;
-  if (!group) {
-    sessionStart = [...existing, desiredHookGroup];
-  } else {
-    const rebuildPresent = group.hooks.some(
-      (h) => h?.command === REBUILD_HOOK,
-    );
-    if (!rebuildPresent) {
-      group.hooks.push({ type: "command", command: REBUILD_HOOK });
-    }
-    sessionStart = existing;
-  }
+  // UserPromptSubmit: the per-prompt routing reminder.
+  const prompt = replaceGroup(
+    current.hooks?.UserPromptSubmit,
+    isHintHook,
+    desiredPromptHookGroup,
+  );
 
   next.hooks = {
     ...(current.hooks ?? {}),
-    SessionStart: sessionStart,
+    SessionStart: session.groups,
+    UserPromptSubmit: prompt.groups,
   };
 
-  return next;
+  return { next, replaced: session.removed + prompt.removed };
 }
 
 function main() {
   const dryRun = process.argv.includes("--dry-run");
 
   const current = readCurrent();
-  const next = merge(current);
+  const { next, replaced } = merge(current);
   const out = JSON.stringify(next, null, 2) + "\n";
 
   if (dryRun) {
@@ -134,6 +169,8 @@ function main() {
   const permsAfter = next.permissions?.allow?.length ?? 0;
   const hookCountBefore = current.hooks?.SessionStart?.length ?? 0;
   const hookCountAfter = next.hooks?.SessionStart?.length ?? 0;
+  const promptBefore = current.hooks?.UserPromptSubmit?.length ?? 0;
+  const promptAfter = next.hooks?.UserPromptSubmit?.length ?? 0;
 
   console.error(`updated ${TARGET}`);
   console.error(
@@ -142,10 +179,16 @@ function main() {
   console.error(
     `  hooks.SessionStart entries: ${hookCountBefore} -> ${hookCountAfter}`,
   );
-  console.error("");
   console.error(
-    "Next steps:",
+    `  hooks.UserPromptSubmit entries: ${promptBefore} -> ${promptAfter}`,
   );
+  if (replaced > 0) {
+    console.error(
+      `  replaced ${replaced} existing kg hook group(s) (stale paths / duplicates)`,
+    );
+  }
+  console.error("");
+  console.error("Next steps:");
   console.error(
     `  1. Register the MCP server (run from inside ${TARGET_REPO}):`,
   );

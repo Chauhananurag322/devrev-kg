@@ -50,7 +50,7 @@ A full cold rebuild of the index runs in ~10 seconds on an M-series Mac.
 │  ─ Resources (kg://repo-map, kg://package/{name}, …)        │
 │  ─ Prompts   (repo_overview, package_context)               │
 │  ─ Tools     (mcp__kg__find_symbol, who_imports, …)         │
-│  ─ Claude Code only: SessionStart hook auto-injects the map │
+│  ─ Claude Code only: hooks inject the map + per-prompt hint │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -152,16 +152,37 @@ claude mcp add kg --scope local \
 
 After restart, `/mcp` lists the `kg` server with its **8 tools, 4 resources, and 2 prompts**. This is all any MCP client needs — the same `node …/server.js` + `KG_DIR` works in Cursor, Cline, and Zed.
 
-### Optional: auto-inject the map (Claude Code only)
-
-To also have the repo-map injected at every session start (and a background rebuild trigger on session start):
+### Optional: auto-inject the map + keep the tools in view (Claude Code only)
 
 ```bash
 cd ../devrev-kg
-pnpm wire    # adds a SessionStart hook to your monorepo's .claude/settings.local.json
+pnpm wire    # adds hooks to your monorepo's .claude/settings.local.json
 ```
 
-This is a Claude-Code convenience layered on top — the resources/prompts above already make the context available everywhere without it.
+This installs two hooks:
+
+| Hook | Fires | Does |
+|---|---|---|
+| `SessionStart` | once per session | `cat`s `repo-map.md` into context, then triggers a background rebuild if the index is stale |
+| `UserPromptSubmit` | **every prompt** | prints a ~50-token reminder to prefer the KG tools over `Grep`/`Glob` |
+
+**Why the second one.** Registering the MCP server makes the tools *available*, but agents
+reliably fall back to habitual `Grep`/`Glob` anyway. `SessionStart` fires once, so its
+guidance ends up tens of thousands of tokens up-context by the middle of a session and stops
+influencing behaviour. `UserPromptSubmit` re-states the routing rule on every turn, which is
+what actually changes tool selection. The reminder is deliberately tiny — it points at the
+tools rather than restating them, since its cost is paid on every single turn.
+
+The repo-map also leads with an imperative routing table ("find a symbol → `find_symbol`,
+not `Grep`") instead of listing tool names in a footer. Bare capability lists don't change
+behaviour; instructions placed first do.
+
+`pnpm wire` is idempotent and self-healing: it matches its own hooks by script path rather
+than exact command string, so re-running after moving `outputDir` refreshes the baked-in
+paths instead of stacking a duplicate that would inject the map twice.
+
+Both hooks are a Claude-Code convenience layered on top — the resources/prompts above already
+make the context available in any client without them.
 
 ## Configuration
 
@@ -238,7 +259,8 @@ devrev-kg/
 │       ├── git.ts               gitSha helpers
 │       └── glob-helpers.ts      glob with always-ignore safety net
 ├── scripts/
-│   ├── wire.mjs                 install SessionStart hooks
+│   ├── wire.mjs                 install SessionStart + UserPromptSubmit hooks
+│   ├── kg-hint.sh               per-prompt "use the KG" routing reminder
 │   └── maybe-rebuild.sh         background rebuild trigger
 ├── config.example.json
 ├── PLAN.md                      original architecture plan
