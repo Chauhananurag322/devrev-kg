@@ -4,11 +4,14 @@
 //
 // Reads config.json (next to this script's parent dir, or $KG_CONFIG) and
 // edits the *targetRepo*'s `.claude/settings.local.json` to add:
-//   - hooks.SessionStart with two entries:
+//   - hooks.SessionStart with three entries:
 //       1. cat repo-map.md into every session's context
 //       2. invoke maybe-rebuild.sh to refresh the index in the background
+//       3. invoke recent-sessions.sh to print breadcrumbs from recent sessions
 //   - hooks.UserPromptSubmit with one entry:
-//       3. invoke kg-hint.sh to re-state the KG routing rule on every prompt
+//       4. invoke kg-hint.sh to re-state the KG routing rule on every prompt
+//   - hooks.SessionEnd with one entry:
+//       5. invoke session-end.sh to journal what this session was about
 //
 // Why both: SessionStart fires ONCE per session, so its guidance drifts far
 // up-context and agents fall back to habitual Grep/Glob after a few turns.
@@ -49,6 +52,8 @@ const REBUILD_HOOK = join(REPO_ROOT, "scripts", "maybe-rebuild.sh");
 // KG_DIR is baked in as an argument so the hint script stays dependency-free
 // (no config parsing) — it runs on every prompt, so startup cost matters.
 const HINT_HOOK = `${join(REPO_ROOT, "scripts", "kg-hint.sh")} ${KG_DIR}`;
+const RECENT_HOOK = `${join(REPO_ROOT, "scripts", "recent-sessions.sh")} ${KG_DIR}`;
+const SESSION_END_HOOK = `${join(REPO_ROOT, "scripts", "session-end.sh")} ${KG_DIR} ${TARGET_REPO}`;
 
 if (!TARGET_REPO || !KG_DIR) {
   console.error("wire: config.json is missing targetRepo or outputDir");
@@ -65,11 +70,18 @@ const desiredHookGroup = {
   hooks: [
     { type: "command", command: HOOK_COMMAND },
     { type: "command", command: REBUILD_HOOK },
+    // Ordered last so the recent-session breadcrumbs read as a footnote to the
+    // map rather than the headline.
+    { type: "command", command: RECENT_HOOK },
   ],
 };
 
 const desiredPromptHookGroup = {
   hooks: [{ type: "command", command: HINT_HOOK }],
+};
+
+const desiredSessionEndGroup = {
+  hooks: [{ type: "command", command: SESSION_END_HOOK }],
 };
 
 // ---- Main --------------------------------------------------------------
@@ -118,6 +130,7 @@ function replaceGroup(groups, match, desired) {
 // configured paths.
 const isRepoMapHook = (c) => c.includes("always/repo-map.md");
 const isHintHook = (c) => c.includes("kg-hint.sh");
+const isSessionEndHook = (c) => c.includes("session-end.sh");
 
 function merge(current) {
   const next = { ...current };
@@ -137,13 +150,24 @@ function merge(current) {
     desiredPromptHookGroup,
   );
 
+  // SessionEnd: journal what this session was about, for the next one to read.
+  const sessionEnd = replaceGroup(
+    current.hooks?.SessionEnd,
+    isSessionEndHook,
+    desiredSessionEndGroup,
+  );
+
   next.hooks = {
     ...(current.hooks ?? {}),
     SessionStart: session.groups,
     UserPromptSubmit: prompt.groups,
+    SessionEnd: sessionEnd.groups,
   };
 
-  return { next, replaced: session.removed + prompt.removed };
+  return {
+    next,
+    replaced: session.removed + prompt.removed + sessionEnd.removed,
+  };
 }
 
 function main() {
@@ -181,6 +205,9 @@ function main() {
   );
   console.error(
     `  hooks.UserPromptSubmit entries: ${promptBefore} -> ${promptAfter}`,
+  );
+  console.error(
+    `  hooks.SessionEnd entries: ${current.hooks?.SessionEnd?.length ?? 0} -> ${next.hooks?.SessionEnd?.length ?? 0}`,
   );
   if (replaced > 0) {
     console.error(

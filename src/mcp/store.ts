@@ -9,10 +9,23 @@
 // and most are read once or never. Lazy reads via fs.promises.readFile keep
 // startup fast and memory low.
 //
-// The store is created once per server lifetime. If the build runs while the
-// server is up, the in-memory _index.json goes stale. We accept that — Phase 4
-// will add a file watcher to reload. For now, restart Claude Code after a
-// rebuild to pick up changes.
+// HOT RELOAD
+//
+// The loaded state above is a snapshot, and a rebuild invalidates it. Worse
+// than stale JSON: writers/sqlite.ts finishes with an atomic rename(2), so our
+// open SQLite handle keeps pointing at the *unlinked* old inode. It answers
+// happily and forever with pre-rebuild data — a silent wrong answer, which is
+// the worst failure mode for a tool whose whole job is being trusted over grep.
+// That is what forced "restart Claude Code after a rebuild".
+//
+// So every tool call goes through ensureFresh() first: stat last-build.json and,
+// if its mtime moved, reload the JSON and reopen the DB. Rationale for stat-on-
+// demand over fs.watch:
+//   - correct across the atomic swap (watching an inode that gets replaced is
+//     exactly the case fs.watch handles worst)
+//   - no watcher leaks, no debounce, no platform differences
+//   - a stat is ~10µs; tool calls are milliseconds. Cost is noise.
+// A short TTL keeps a burst of calls from stat-ing on every single one.
 
 import { readFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -26,6 +39,8 @@ type Db = Database.Database;
 
 export interface Store {
   kgDir: string;
+  // MUTABLE: replaced wholesale by a reload. Tools must not capture these
+  // across an await — read store.index at point of use, not into a local.
   index: IndexEntry[]; // _index.json contents
   indexByName: Map<string, IndexEntry>; // O(1) lookup
   curated: CuratedDoc[];
@@ -36,6 +51,12 @@ export interface Store {
   // Claude Code memory dirs we surface, in priority order. Resolved once at
   // startup (the paths are static); the FILES inside are re-read per call.
   memoryDirs: string[];
+  // Reload if the build on disk is newer than what we hold. Every tool calls
+  // this first; it is a cheap stat in the common case.
+  ensureFresh(): Promise<void>;
+  // How many times we've reloaded. Surfaced by get_repo_overview for debugging
+  // "is the server actually seeing my rebuild?".
+  reloads: number;
   // File ops scoped to this store.
   readManifest(name: string): Promise<Manifest | null>;
   readRepoMap(): Promise<string | null>;
@@ -90,6 +111,11 @@ function deriveMemoryDirs(
   return [...new Set(candidates)];
 }
 
+// Re-stat no more often than this. A tool call burst (agents fire several in a
+// row) then costs one stat, not one per call. 2s is far below the ~12s rebuild,
+// so a fresh build is still picked up on effectively the next call.
+const FRESHNESS_TTL_MS = 2000;
+
 export async function openStore(
   kgDir: string,
   opts: OpenStoreOptions = {},
@@ -98,46 +124,115 @@ export async function openStore(
   const curatedPath = join(kgDir, "curated.json");
   const lastBuildPath = join(kgDir, "last-build.json");
   const repoMapPath = join(kgDir, "always", "repo-map.md");
-
-  // _index.json must exist; everything else is best-effort.
-  const indexRaw = await readFile(indexPath, "utf8").catch(() => null);
-  if (!indexRaw) {
-    throw new Error(
-      `KG not built yet — _index.json missing at ${indexPath}. Run: cd ~/Office/devrev-kg && pnpm kg:full`,
-    );
-  }
-  const index = JSON.parse(indexRaw) as IndexEntry[];
-  const indexByName = new Map(index.map((e) => [e.name, e]));
-
-  const curatedRaw = await readFile(curatedPath, "utf8").catch(() => null);
-  const curated = curatedRaw ? (JSON.parse(curatedRaw) as CuratedDoc[]) : [];
-
-  const lastBuildRaw = await readFile(lastBuildPath, "utf8").catch(() => null);
-  const lastBuild = lastBuildRaw
-    ? (JSON.parse(lastBuildRaw) as LastBuild)
-    : null;
-
-  // Open the SQLite DB if Phase 3 has produced one. Read-only so a concurrent
-  // rebuild can't interfere; WAL mode means our snapshot stays consistent
-  // until restart even if the file is replaced via atomicSwap.
   const dbPath = join(kgDir, "db", "kg.sqlite");
+
+  // Mutable slots. `store` below closes over these, so a reload swaps the data
+  // out from under every already-registered tool without re-registering.
+  let index: IndexEntry[] = [];
+  let indexByName = new Map<string, IndexEntry>();
+  let curated: CuratedDoc[] = [];
+  let lastBuild: LastBuild | null = null;
   let db: Db | null = null;
-  if (existsSync(dbPath)) {
-    db = new Database(dbPath, { readonly: true });
-    db.pragma("journal_mode = WAL");
-    db.pragma("query_only = true");
+
+  // mtime of last-build.json as of our last load — the staleness sentinel.
+  // The build writes it last, after the DB swap, so if it has moved then the
+  // rest of the outputs are already in place.
+  let loadedMtimeMs = 0;
+  let lastCheckedAt = 0;
+  let reloads = 0;
+
+  async function load(isReload: boolean): Promise<void> {
+    // _index.json must exist; everything else is best-effort.
+    const indexRaw = await readFile(indexPath, "utf8").catch(() => null);
+    if (!indexRaw) {
+      if (isReload) return; // mid-rebuild; keep serving what we have
+      throw new Error(
+        `KG not built yet — _index.json missing at ${indexPath}. Run: cd ~/Office/devrev-kg && pnpm kg:full`,
+      );
+    }
+
+    // A rebuild rewrites these files while we may be reading them. Every write
+    // is atomic (writeFileAtomic → rename), so we never see a torn file — but a
+    // JSON parse error still shouldn't take the server down mid-session.
+    try {
+      const parsedIndex = JSON.parse(indexRaw) as IndexEntry[];
+      index = parsedIndex;
+      indexByName = new Map(parsedIndex.map((e) => [e.name, e]));
+    } catch (err) {
+      if (!isReload) throw err;
+      return; // keep the previous good snapshot
+    }
+
+    const curatedRaw = await readFile(curatedPath, "utf8").catch(() => null);
+    curated = curatedRaw ? (JSON.parse(curatedRaw) as CuratedDoc[]) : [];
+
+    const lastBuildRaw = await readFile(lastBuildPath, "utf8").catch(() => null);
+    lastBuild = lastBuildRaw ? (JSON.parse(lastBuildRaw) as LastBuild) : null;
+
+    // Reopen the DB. REQUIRED, not just nice-to-have: the build ends in an
+    // atomic rename, so the old handle points at an unlinked inode and would
+    // keep serving pre-rebuild rows indefinitely.
+    if (db) {
+      try {
+        db.close();
+      } catch {
+        // Already closed / never fully opened. Nothing to recover.
+      }
+      db = null;
+    }
+    if (existsSync(dbPath)) {
+      try {
+        db = new Database(dbPath, { readonly: true });
+        db.pragma("journal_mode = WAL");
+        db.pragma("query_only = true");
+      } catch {
+        // Swap raced us. Leave db null; the next ensureFresh() retries, and
+        // tools already handle a null db (Phase-3-not-built path).
+        db = null;
+      }
+    }
+
+    const st = await stat(lastBuildPath).catch(() => null);
+    loadedMtimeMs = st?.mtimeMs ?? 0;
+    if (isReload) reloads += 1;
   }
+
+  await load(false);
 
   const memoryDirs = deriveMemoryDirs(kgDir, opts, homedir());
 
   return {
     kgDir,
-    index,
-    indexByName,
-    curated,
-    lastBuild,
-    db,
+    get index() {
+      return index;
+    },
+    get indexByName() {
+      return indexByName;
+    },
+    get curated() {
+      return curated;
+    },
+    get lastBuild() {
+      return lastBuild;
+    },
+    get db() {
+      return db;
+    },
+    get reloads() {
+      return reloads;
+    },
     memoryDirs,
+    async ensureFresh(): Promise<void> {
+      const now = Date.now();
+      if (now - lastCheckedAt < FRESHNESS_TTL_MS) return;
+      lastCheckedAt = now;
+
+      const st = await stat(lastBuildPath).catch(() => null);
+      if (!st) return; // never built, or mid-swap — keep current snapshot
+      if (st.mtimeMs === loadedMtimeMs) return;
+
+      await load(true);
+    },
     async readMemories(): Promise<MemoryDoc[]> {
       return readMemories(memoryDirs);
     },

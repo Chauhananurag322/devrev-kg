@@ -108,6 +108,53 @@ The resources and prompts above make the repo context available **without** the 
 - **Claude Code** — mention a resource in a message with `@kg:kg://repo-map`, or run a prompt as a slash command: `/mcp__kg__repo_overview`. (These complement the optional SessionStart hook from `pnpm wire`, which auto-injects the map at session start.)
 - **Cursor / Cline / Zed** — once the server is registered, resources appear in the client's MCP resource picker and prompts appear as commands automatically. No SessionStart hook needed — that's the point of exposing these primitives.
 
+## No restart after a rebuild
+
+The MCP server hot-reloads. Every tool call first stats `last-build.json`; if its
+mtime moved, the server reloads `_index.json` / `curated.json` and **reopens the SQLite
+handle**, then answers from the new data. Combined with the `SessionStart` rebuild
+trigger, you no longer run `pnpm kg:full` by hand or restart Claude Code to consume it.
+
+Reopening the DB is the load-bearing part, not an optimization. The build ends with an
+atomic `rename(2)`, so a long-lived handle keeps pointing at the **unlinked old inode** and
+serves pre-rebuild rows indefinitely — a silent wrong answer from the tool you adopted
+specifically to trust over `grep`. That is what previously forced the restart.
+
+Why stat-on-demand rather than `fs.watch`: it stays correct across the atomic swap (an
+inode being replaced is precisely what `fs.watch` handles worst), needs no watcher
+lifecycle or debounce, and behaves identically on every platform. A `stat` is ~10µs against
+millisecond tool calls, and a 2s TTL collapses a burst of calls into one check.
+
+Freshness is enforced by a Proxy over the server's `register*` methods
+(`src/mcp/freshness.ts`), so all 16 handlers — and every future one — get it by
+construction instead of by remembering to call it.
+
+## Session continuity
+
+`SessionEnd` appends one line per session to `<KG_DIR>/sessions.jsonl`; `SessionStart`
+prints the most recent few. A new session therefore opens knowing where the last one left
+off, without replaying a ~170k-token transcript.
+
+What gets recorded is only what is **mechanically derivable and already trustworthy**:
+
+| Field | Source |
+|---|---|
+| `aiTitle` | the session title **Claude Code itself generated** — the one genuinely summarized field available |
+| `lastPrompt` | the final user ask, whitespace-collapsed and clipped to 240 chars |
+| `gitSha`, `dirtyFiles` | target repo state at session end |
+| `turns`, `toolCalls` | activity counts, used to skip trivial sessions |
+
+**This is not a summarizer, by design.** A hook is a shell script; it cannot distill a
+conversation — only a model can. Rather than fake that with heuristics, the journal records
+facts and leaves judgment to the two mechanisms that have it: `recall_memory` for *why*
+(written deliberately by the agent) and the index for *what* (derived from the repo). The
+`<recent-sessions>` block is explicitly labelled as past state to verify, not instructions
+to follow.
+
+The journal is capped at 50 entries, re-entrant on the same `sessionId` (a resume replaces
+its earlier record rather than duplicating it), written atomically because `SessionStart`
+reads it, and silent on first run in a fresh repo.
+
 ## Memory integration
 
 `recall_memory` + `kg://memory` read the **same files Claude Code's own memory tool
@@ -200,12 +247,13 @@ cd ../devrev-kg
 pnpm wire    # adds hooks to your monorepo's .claude/settings.local.json
 ```
 
-This installs two hooks:
+This installs three hooks:
 
 | Hook | Fires | Does |
 |---|---|---|
-| `SessionStart` | once per session | `cat`s `repo-map.md` into context, then triggers a background rebuild if the index is stale |
+| `SessionStart` | once per session | `cat`s `repo-map.md` into context, triggers a background rebuild if the index is stale, and prints breadcrumbs from recent sessions |
 | `UserPromptSubmit` | **every prompt** | prints a ~50-token reminder to prefer the KG tools over `Grep`/`Glob` |
+| `SessionEnd` | session exit | journals what the session was about to `sessions.jsonl`, for the next session to read |
 
 **Why the second one.** Registering the MCP server makes the tools *available*, but agents
 reliably fall back to habitual `Grep`/`Glob` anyway. `SessionStart` fires once, so its
@@ -264,9 +312,12 @@ After running `pnpm wire`, every Claude Code session in your target repo runs a 
 2. Compares to the target repo's current `git rev-parse HEAD`
 3. If drifted, fires `pnpm kg:full` in the **background** and returns immediately
 
-The rebuild finishes ~10s later. Your **next** Claude session sees the fresh data; the current session keeps its consistent snapshot until restarted.
+The rebuild finishes ~10s later, and the **current** session picks it up on its next tool
+call — the server reloads when it sees `last-build.json` change. No restart, and no waiting
+for the next session.
 
-To force a fresh rebuild manually: `pnpm kg:full`. Restart Claude Code to consume it.
+To force a fresh rebuild manually: `pnpm kg:full`. No restart needed — the server picks it
+up on the next tool call (see [No restart after a rebuild](#no-restart-after-a-rebuild)).
 
 ## Repo layout
 
@@ -301,8 +352,10 @@ devrev-kg/
 │       ├── git.ts               gitSha helpers
 │       └── glob-helpers.ts      glob with always-ignore safety net
 ├── scripts/
-│   ├── wire.mjs                 install SessionStart + UserPromptSubmit hooks
+│   ├── wire.mjs                 install SessionStart/UserPromptSubmit/SessionEnd hooks
 │   ├── kg-hint.sh               per-prompt "use the KG" routing reminder
+│   ├── session-end.sh           journal the finished session to sessions.jsonl
+│   ├── recent-sessions.sh       print recent-session breadcrumbs at startup
 │   └── maybe-rebuild.sh         background rebuild trigger
 ├── config.example.json
 ├── PLAN.md                      original architecture plan
@@ -311,7 +364,6 @@ devrev-kg/
 
 ## Roadmap
 
-- File-watcher to live-reload the MCP server's DB handle when kg.sqlite changes (eliminates the "restart Claude after rebuild" step)
 - True incremental `kg:affected` (currently triggers a full rebuild)
 - Expose curated docs (CLAUDE.md / rules / skills) as `kg://` resources once the build writes their bodies into `KG_DIR` (currently only metadata is indexed)
 - Generalize beyond Nx: a pluggable workspace probe (Turbo, Bazel, npm workspaces)

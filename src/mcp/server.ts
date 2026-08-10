@@ -52,6 +52,7 @@ import { registerGetDependencyPath } from "./tools/get_dependency_path.js";
 import { registerRecallMemory } from "./tools/recall_memory.js";
 import { registerResources } from "./resources.js";
 import { registerPrompts } from "./prompts.js";
+import { withFreshness } from "./freshness.js";
 import { log } from "../log.js";
 
 async function main(): Promise<void> {
@@ -105,20 +106,26 @@ async function main(): Promise<void> {
     },
   );
 
-  registerGetRepoOverview(server, store);
-  registerListPackages(server, store);
-  registerGetPackage(server, store);
-  registerFindSkill(server, store);
-  registerFindSymbol(server, store);
-  registerSearchCode(server, store);
-  registerWhoImports(server, store);
-  registerGetDependencyPath(server, store);
-  registerRecallMemory(server, store);
+  // Register through the freshness proxy so every handler re-checks the build
+  // on disk before answering. Without this, a rebuild during the session leaves
+  // the SQLite handle pointing at the renamed-away inode and we serve stale rows
+  // forever — silently. See mcp/freshness.ts and the HOT RELOAD note in store.ts.
+  const fresh = withFreshness(server, store);
+
+  registerGetRepoOverview(fresh, store);
+  registerListPackages(fresh, store);
+  registerGetPackage(fresh, store);
+  registerFindSkill(fresh, store);
+  registerFindSymbol(fresh, store);
+  registerSearchCode(fresh, store);
+  registerWhoImports(fresh, store);
+  registerGetDependencyPath(fresh, store);
+  registerRecallMemory(fresh, store);
 
   // Standard MCP primitives — resources + prompts — so the repo context is
   // discoverable by ANY client, not just Claude Code's SessionStart hook.
-  registerResources(server, store);
-  registerPrompts(server, store);
+  registerResources(fresh, store);
+  registerPrompts(fresh, store);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
